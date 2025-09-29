@@ -54,15 +54,15 @@ def create_system_inspection(company_ref: str, facility_ref: str, checklist_ref:
         "status": "Pending",
         "isActive": True,
         "isUnSchedule": True,
+        "isDeleted" : False,
         "companyRef": ObjectId(company_ref),
         "facilityRef": ObjectId(facility_ref),
         "checklistRef": ObjectId(checklist_ref),
         "assignee": [],
         "followers": [],
-        "createdby": ObjectId(company_ref),
-        "updatedby": ObjectId(company_ref),
         "createdAt": datetime.utcnow(),
-        "updatedAt": datetime.utcnow()
+        "updatedAt": datetime.utcnow(),
+        "__v" : 0
     }
     result = inspections_col.insert_one(inspection_payload)
     print(f"[INFO] ✅ New inspection created with ID: {result.inserted_id}")
@@ -119,7 +119,7 @@ def fetch_files_from_sftp():
                     sort=[("createdAt", -1)]
                 )
 
-                if existing:
+                if 1 != 1:
                     print("[INFO] Existing file found, reusing references.")
                     inspection_ref = existing["inspectionRef"]
                     checklist_ref = existing["checklistRef"]
@@ -144,7 +144,7 @@ def fetch_files_from_sftp():
                 doc = {
                     "checklistRef": ObjectId(checklist_ref),
                     "inspectionRef": ObjectId(inspection_ref),
-                    "inspectionDate": datetime.utcnow(),
+                    "inspectionDate": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
                     "filePath": local_path,
                     "status": "Pending",
                     "userinfo": ObjectId(userinfo),
@@ -153,7 +153,8 @@ def fetch_files_from_sftp():
                     "isBulkSystemUpload": True,
                     "source": "System",
                     "lastRecord": 0,
-                    "createdAt": datetime.utcnow()
+                    "createdAt": datetime.utcnow(),
+                    "__v":0
                 }
                 file_uploads_col.insert_one(doc)
                 print("[✅] Document saved to checklistfileuploads.")
