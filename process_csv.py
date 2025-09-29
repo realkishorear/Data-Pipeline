@@ -7,7 +7,8 @@ import logging
 import resource
 from datetime import datetime
 from bson import ObjectId
-from dateutil.parser import parse, ParserError
+from dateutil import parser
+from dateutil.parser import parse
 from pymongo import MongoClient, UpdateOne, ReturnDocument
 from helpers.apis import find_one, schedule_inspection_open, inspection_completed
 from helpers.dateTime import check_date_and_time
@@ -157,16 +158,17 @@ def process_csv_file(local_csv_path: str):
             userid = process_model["userinfo"]
 
             for i, q in enumerate(question_meta):
-                value = row_values[i].strip() if i < len(row_values) else None  # Added strip to match TS trim
+                value = row_values[i].strip() if i < len(
+                    row_values) else None  # Added strip to match TS trim
                 answer_obj = {
-                    "_id": q["_id"],
+                    "_id": ObjectId(q["_id"]),
                     "isHide": q["isHide"],
                     "type": q["type"],
                     "title": q["title"],
-                    "checklistRef": q["checklistRef"],
-                    "sectionRef": q["sectionRef"],
-                    "createdAt": q["createdAt"],
-                    "updatedAt": q["updatedAt"],
+                    "checklistRef": ObjectId(q["checklistRef"]),
+                    "sectionRef": ObjectId(q["sectionRef"]),
+                    "createdAt": parser.isoparse(q["createdAt"]),
+                    "updatedAt": parser.isoparse(q["updatedAt"]),
                     "__v": q["__v"],
                     "checklistQuestionDetailsRef": q["checklistQuestionDetailsRef"],
                     "checklistQuestionRef": q["checklistQuestionRef"],
@@ -266,22 +268,26 @@ def process_csv_file(local_csv_path: str):
 
                 bulk_ops.append(
                     UpdateOne(
-                        {
+                        filter={
                             "inspectionRef": process_model["inspectionRef"],
                             "checklistRef": process_model["checklistRef"],
                             "answer.title": answer_obj["title"],
                             "order": row_order,
                         },
-                        {
+                        update={
                             "$set": {
                                 "checklistRef": process_model["checklistRef"],
-                                "inspectionDate": process_model["inspectionDate"],
+                                "inspectionDate": parse(process_model["inspectionDate"]) if isinstance(process_model["inspectionDate"], str) else process_model["inspectionDate"],
                                 "inspectionRef": process_model["inspectionRef"],
                                 "userRef": userid,
                                 "answer": answer_obj,
                                 "order": row_order,
                                 "commonId": q["commonId"],
                                 "isBulkSystemPickList": "zeropicklist",
+                                "updatedAt": datetime.utcnow(),
+                            },
+                            "$setOnInsert": {
+                                "createdAt": datetime.utcnow(),
                             },
                         },
                         upsert=True
@@ -322,7 +328,10 @@ def process_csv_file(local_csv_path: str):
             "sortBy": "",
             "sortOrder": "asc",
             "isQRupload": False,
-            "isEvent": True  # Changed to True to bypass userRef filter in fetching, making data visible to all users
+            "isEvent": False,
+            "publicloginFirstName": "",
+            "publicloginLastName": "",
+            "publicloginEmail": ""
         }
 
         logger.info("Calling inspection_completed API...")
@@ -374,7 +383,8 @@ def stream_local_csv(local_path, process_row, bulk_ops, max_bulk_ops, checklist_
             )
 
             for row in parser:
-                row = [v.strip() for v in row]  # Added full strip to match TS trim: true
+                # Added full strip to match TS trim: true
+                row = [v.strip() for v in row]
                 if is_header:
                     headers = row
                     is_header = False

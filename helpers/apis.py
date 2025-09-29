@@ -24,7 +24,7 @@ def find_one(checklist_id: str):
 
     url = f"{base_url}/checklist/{checklist_id}"
     headers = {"Authorization": f"Bearer {jwt_token}"}
-    payload = {"isExcel": True}  # Payload for body
+    payload = { "isExcel": True  }  # Payload for body
 
     logging.info(f"[find_one] Requesting checklist_id={checklist_id} from {url}")
 
@@ -43,7 +43,6 @@ def find_one(checklist_id: str):
     except Exception as e:
         logging.exception("[find_one] Unexpected error")
         return {"error": "unexpected", "message": str(e)}
-
 
 def schedule_inspection_open(process_model: dict):
     """Open a scheduled inspection."""
@@ -79,7 +78,6 @@ def schedule_inspection_open(process_model: dict):
     except Exception as e:
         logging.exception("[schedule_inspection_open] Unexpected error")
         return {"error": "unexpected", "message": str(e)}
-
 
 def inspection_completed(body: dict):
     """Mark an inspection as completed."""
