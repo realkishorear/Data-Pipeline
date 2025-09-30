@@ -377,9 +377,26 @@ def stream_local_csv(local_path, process_row, bulk_ops, max_bulk_ops, checklist_
     try:
         # Changed to latin-1 to handle 0xa0 and similar bytes
         with open(local_path, "r", encoding="latin-1") as f:
+            sample = f.read(1024)
+            try:
+                dialect = csv.Sniffer().sniff(sample)
+            except csv.Error:
+                # Fallback to counting delimiters
+                comma_count = sample.count(',')
+                pipe_count = sample.count('|')
+                if pipe_count > comma_count:
+                    delimiter = '|'
+                else:
+                    delimiter = ','
+                dialect = csv.excel
+                dialect.delimiter = delimiter
+                logger.info(f"Fallback delimiter detected: {delimiter}")
+            # Override quoting and skipinitialspace to match original behavior
+            dialect.quoting = csv.QUOTE_NONE
+            dialect.skipinitialspace = True
+            f.seek(0)
             parser = csv.reader(
-                f, delimiter="|", quoting=csv.QUOTE_NONE,
-                skipinitialspace=True, strict=False
+                f, dialect=dialect, strict=False
             )
 
             for row in parser:
@@ -389,6 +406,10 @@ def stream_local_csv(local_path, process_row, bulk_ops, max_bulk_ops, checklist_
                     headers = row
                     is_header = False
                     logger.info(f"CSV headers detected: {headers}")
+                    continue
+
+                # Skip empty rows
+                if not any(row):
                     continue
 
                 row_number += 1
