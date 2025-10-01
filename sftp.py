@@ -183,6 +183,16 @@ def fetch_files_from_sftp():
                     os.remove(local_path)
                     print(f"[INFO] Temporary file deleted: {local_path}")
 
+                # Update lastUpdatedAt in checklistmaps for this prefix
+                update_result = checklist_map_col.update_one(
+                    {"acronym": {"$regex": f"^{prefix.strip()}$", "$options": "i"}},
+                    {"$set": {"lastUpdatedAt": datetime.utcnow()}}
+                )
+                if update_result.matched_count > 0:
+                    print(f"[INFO] Updated lastUpdatedAt for prefix '{prefix}' in checklistmaps.")
+                else:
+                    print(f"[WARN] No matching document found to update lastUpdatedAt for prefix '{prefix}'.")
+
                 successful += 1
 
             except Exception as file_err:
