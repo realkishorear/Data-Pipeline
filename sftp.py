@@ -1,5 +1,4 @@
 import os
-import time
 import stat
 from datetime import datetime
 import paramiko
@@ -67,8 +66,6 @@ def create_system_inspection(company_ref: str, facility_ref: str, checklist_ref:
     result = inspections_col.insert_one(inspection_payload)
     print(f"[INFO] ✅ New inspection created with ID: {result.inserted_id}")
     return str(result.inserted_id)
-
-
 
 
 # ── Main SFTP processing function ─────────────────────────────────────────────

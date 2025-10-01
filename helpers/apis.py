@@ -10,7 +10,37 @@ logging.basicConfig(
 )
 
 def getAuthToken():
-    # TODO: Implement token retrieval
+    
+    base_url = os.getenv("BASE_API_URL")
+    url = f"{base_url}/auth/login"
+    payload = {
+        "email" : "sid1@knowella.com",
+        "password" : "Testing@1234321",
+        "withoutToken" : True
+    }
+    headers = {
+        "Content-Type": "application/json"
+    }
+    
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=30)
+        response.raise_for_status()
+        logging.info(f"[inspection_completed] Success: {response.status_code}")
+        authTokenJSON = response.json()
+        auth_token = authTokenJSON['data']['access_token']
+        return auth_token
+
+    except Timeout:
+        logging.error("[inspection_completed] Request timed out")
+        return {"error": "timeout", "message": "The request timed out"}
+    except RequestException as e:
+        logging.exception("[inspection_completed] Request failed")
+        return {"error": "request_failed", "message": str(e)}
+    except Exception as e:
+        logging.exception("[inspection_completed] Unexpected error")
+        return {"error": "unexpected", "message": str(e)}
+    
+    
     return os.getenv("JWT_TOKEN")  # Example placeholder
 
 def find_one(checklist_id: str):
