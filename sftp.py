@@ -88,6 +88,12 @@ def fetch_files_from_sftp():
     company_ref = "68ca635393105c0c3fcd8b0e"
     facility_ref = "68ca635393105c0c3fcd8b11"
     userinfo = "68ca635393105c0c3fcd8b14"
+    
+    # Get the most recent createdAt from checklistfileuploads collection
+    last_upload_doc = file_uploads_col.find_one({}, sort=[("createdAt", -1)])
+    last_updated = last_upload_doc["createdAt"] if last_upload_doc else datetime.min
+
+    print(f"[INFO] Most recent upload time: {last_updated}")
 
     try:
         print(f"[INFO] Connecting to SFTP: {SFTP_HOST}")
@@ -96,6 +102,8 @@ def fetch_files_from_sftp():
         sftp = ssh.open_sftp()
 
         files = sftp.listdir_attr(SFTP_REMOTE_DIR)
+        print(files)
+        
         print(f"[INFO] Total files found: {len(files)}")
 
         for f in files:
@@ -103,14 +111,21 @@ def fetch_files_from_sftp():
                 print(f"[SKIP] Non-regular/hidden file: {f.filename}")
                 continue
 
-            processed += 1
             file_name = f.filename
+            file_mtime = datetime.fromtimestamp(f.st_mtime)
+            
+            if file_mtime <= last_updated:
+                print(f"[SKIP] File {file_name} not modified after last upload time ({last_updated}).")
+                continue
+
+            processed += 1
             remote_path = f"{SFTP_REMOTE_DIR}/{file_name}"
             prefix = file_name[:2].strip()
 
             print("-" * 60)
             print(f"[{processed}] Processing file: {file_name}")
             print(f"   ➤ Prefix: {prefix}")
+            print(f"   ➤ File modified time: {file_mtime}")
 
             try:
                 # Check if record already exists
@@ -173,8 +188,8 @@ def fetch_files_from_sftp():
                 print(f"[❌] Error processing {file_name}: {file_err}")
                 failed += 1
 
-            print("[INFO] Waiting 60 seconds before next file...")
-            time.sleep(60)
+            # print("[INFO] Waiting 60 seconds before next file...")
+            # time.sleep(60)
 
         print("=" * 60)
         print(
