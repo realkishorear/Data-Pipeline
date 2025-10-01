@@ -60,14 +60,14 @@ def process_csv_file(local_csv_path: str):
 
     try:
         updated_file = checklist_file_upload_collection.find_one_and_update(
-            {"_id": file_doc["_id"], "status": "Pending"},
+            {"_id": file_doc["_id"], "status": {"$in": ["Pending", "Failed"]}},
             {"$set": {"status": "Processing"}},
             return_document=ReturnDocument.AFTER
         )
 
         if not updated_file:
             logger.info(
-                f"File {file_doc['_id']} already processed or not Pending. Skipping.")
+                f"File {file_doc['_id']} already processed or not in Pending/Failed. Skipping.")
             return
 
         process_model = updated_file
@@ -140,6 +140,30 @@ def process_csv_file(local_csv_path: str):
             start_order = int(max_order_doc["order"]) + 1
         logger.info(f"Starting order index at {start_order}")
 
+        # Adjust skip_rows to the last complete row
+        skip_rows = process_model.get("lastRecord", 0)
+        Q = len(question_meta)
+        if Q > 0:
+            current_skip = skip_rows
+            while current_skip > 0:
+                order_to_check = start_order + current_skip - 1
+                count = checklist_inspection_collection.count_documents({
+                    "inspectionRef": process_model["inspectionRef"],
+                    "checklistRef": process_model["checklistRef"],
+                    "order": order_to_check
+                })
+                if count == Q:
+                    break
+                else:
+                    current_skip -= 1
+            if current_skip != skip_rows:
+                logger.info(f"Adjusted skip_rows from {skip_rows} to {current_skip} based on complete rows in DB")
+                checklist_file_upload_collection.update_one(
+                    {"_id": file_doc["_id"]},
+                    {"$set": {"lastRecord": current_skip}}
+                )
+                skip_rows = current_skip
+
         row_index = 0
 
         def process_row(row_values, headers, bulk_ops):
@@ -147,8 +171,8 @@ def process_csv_file(local_csv_path: str):
             row_order = row_index + start_order
             row_index += 1
 
-            if row_index % 1000 == 0:
-                logger.info(f"Processed {row_index} rows so far...")
+            if (process_model.get("lastRecord", 0) + row_index) % 1000 == 0:
+                logger.info(f"Processed {process_model.get('lastRecord', 0) + row_index} rows so far...")
 
             if row_index == 1:
                 logger.debug(f"CSV Headers raw: {headers}")
@@ -300,7 +324,10 @@ def process_csv_file(local_csv_path: str):
             process_row,
             bulk_ops,
             MAX_BULK_OPS,
-            checklist_inspection_collection
+            checklist_inspection_collection,
+            checklist_file_upload_collection,
+            file_doc["_id"],
+            skip_rows
         )
 
         # Free memory
@@ -367,11 +394,13 @@ def process_csv_file(local_csv_path: str):
 # ---------------------------------------------------------------------------
 
 
-def stream_local_csv(local_path, process_row, bulk_ops, max_bulk_ops, checklist_inspection_model):
+def stream_local_csv(local_path, process_row, bulk_ops, max_bulk_ops, checklist_inspection_model, file_uploads_col, file_id, skip_rows):
     """Stream CSV rows and perform batched bulk writes with detailed logging."""
     headers = []
     is_header = True
     row_number = 0
+    row_index = 0
+    skipped = 0
 
     logger.info(f"Opening CSV file: {local_path}")
     try:
@@ -408,11 +437,15 @@ def stream_local_csv(local_path, process_row, bulk_ops, max_bulk_ops, checklist_
                     logger.info(f"CSV headers detected: {headers}")
                     continue
 
-                # Skip empty rows
+                row_number += 1
+
                 if not any(row):
                     continue
 
-                row_number += 1
+                if skipped < skip_rows:
+                    skipped += 1
+                    continue
+
                 process_row(row, headers, bulk_ops)
 
                 if len(bulk_ops) >= max_bulk_ops:
@@ -420,6 +453,11 @@ def stream_local_csv(local_path, process_row, bulk_ops, max_bulk_ops, checklist_
                         f"Flushing {len(bulk_ops)} ops at row {row_number}...")
                     checklist_inspection_model.bulk_write(
                         bulk_ops, ordered=False)
+                    file_uploads_col.update_one(
+                        {"_id": file_id},
+                        {"$set": {"lastRecord": skip_rows + row_number}}
+                    )
+                    logger.info(f"✅ Updated lastRecord to {skip_rows + row_number}")
                     logger.info(
                         f"✅ DB updated with {len(bulk_ops)} records at row {row_number}")
                     print("Before clearing : ", heap_usage())
@@ -432,6 +470,11 @@ def stream_local_csv(local_path, process_row, bulk_ops, max_bulk_ops, checklist_
         if bulk_ops:
             logger.info(f"Flushing final {len(bulk_ops)} ops...")
             checklist_inspection_model.bulk_write(bulk_ops, ordered=False)
+            file_uploads_col.update_one(
+                {"_id": file_id},
+                {"$set": {"lastRecord": skip_rows + row_number}}
+            )
+            logger.info(f"✅ Updated lastRecord to {skip_rows + row_number}")
             logger.info(f"✅ Final DB update with {len(bulk_ops)} records")
             print("Before clearing : ", heap_usage())
             bulk_ops.clear()
