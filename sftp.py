@@ -112,7 +112,7 @@ def fetch_files_from_sftp():
                 continue
 
             file_name = f.filename
-            file_mtime = datetime.fromtimestamp(f.st_mtime)
+            file_mtime = datetime.utcfromtimestamp(f.st_mtime)
             
             if file_mtime <= last_updated:
                 print(f"[SKIP] File {file_name} not modified after last upload time ({last_updated}).")
@@ -169,7 +169,8 @@ def fetch_files_from_sftp():
                     "source": "System",
                     "lastRecord": 0,
                     "createdAt": datetime.utcnow(),
-                    "__v":0
+                    "__v":0,
+                    "fileName": file_name
                 }
                 file_uploads_col.insert_one(doc)
                 print("[✅] Document saved to checklistfileuploads.")
