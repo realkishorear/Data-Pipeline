@@ -6,6 +6,9 @@ from bson import ObjectId
 from pymongo import MongoClient
 from dotenv import load_dotenv
 from process_csv import process_csv_file
+import smtplib
+from email.mime.text import MIMEText
+import ssl  # For SSL context
 
 # ── Load environment variables ────────────────────────────────────────────────
 load_dotenv()
@@ -17,9 +20,22 @@ SFTP_REMOTE_DIR = os.getenv("SFTP_REMOTE_DIR")
 MONGO_URI = os.getenv("DB_URL")
 TEMP_DOWNLOAD_DIR = os.getenv("FILE_PATH")  # temporary download folder
 
+# Email configuration from .env (matched to your provided variable names)
+SMTP_SERVER = os.getenv("EMAIL_HOST")
+SMTP_PORT = int(os.getenv("EMAIL_PORT", 587))
+SMTP_USER = os.getenv("EMAIL_USER")
+SMTP_PASS = os.getenv("EMAIL_PASSWORD")
+FROM_EMAIL = os.getenv("EMAIL_FROM_USER")
+TO_EMAIL = os.getenv("TO_EMAIL")  # Ensure this is set in your .env file (e.g., TO_EMAIL=your.email@example.com)
+
 if not all([SFTP_HOST, SFTP_USER, SFTP_KEY_PATH, SFTP_REMOTE_DIR, MONGO_URI]):
     raise RuntimeError(
         "❌ Missing one or more required environment variables in .env")
+
+# Check email env vars (updated to match your names)
+if not all([SMTP_SERVER, SMTP_USER, SMTP_PASS, FROM_EMAIL, TO_EMAIL]) or SMTP_PORT not in [25, 465, 587]:
+    raise RuntimeError(
+        "❌ Missing/invalid email environment variables in .env (supported ports: 25, 465, 587). Also, ensure TO_EMAIL is set.")
 
 # ── Ensure local folder exists ────────────────────────────────────────────────
 os.makedirs(TEMP_DOWNLOAD_DIR, exist_ok=True)
@@ -35,7 +51,6 @@ file_uploads_col = db["checklistfileuploads"]
 
 # ── Helper functions ──────────────────────────────────────────────────────────
 
-
 def ensure_prefix_in_db(prefix: str):
     mapping = checklist_map_col.find_one({
         "acronym": {"$regex": f"^{prefix.strip()}$", "$options": "i"}
@@ -46,7 +61,6 @@ def ensure_prefix_in_db(prefix: str):
     else:
         print(f"[DEBUG] No mapping found for prefix '{prefix}'")
         return None
-
 
 def create_system_inspection(company_ref: str, facility_ref: str, checklist_ref: str) -> str:
     inspection_payload = {
@@ -67,9 +81,66 @@ def create_system_inspection(company_ref: str, facility_ref: str, checklist_ref:
     print(f"[INFO] ✅ New inspection created with ID: {result.inserted_id}")
     return str(result.inserted_id)
 
+def send_email(subject: str, body: str):
+    """Send an email notification."""
+    msg = MIMEText(body)
+    msg['Subject'] = subject
+    msg['From'] = FROM_EMAIL
+    msg['To'] = TO_EMAIL
+
+    context = ssl.create_default_context()  # For better SSL handling
+
+    try:
+        if SMTP_PORT == 465:
+            # Use SMTP_SSL for port 465 (SSL)
+            with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=context) as server:
+                server.login(SMTP_USER, SMTP_PASS)
+                server.sendmail(FROM_EMAIL, TO_EMAIL, msg.as_string())
+        else:
+            # Use SMTP with STARTTLS for port 587 or 25
+            with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+                server.starttls(context=context)
+                server.login(SMTP_USER, SMTP_PASS)
+                server.sendmail(FROM_EMAIL, TO_EMAIL, msg.as_string())
+        print(f"[✅] Email sent: {subject}")
+    except smtplib.SMTPAuthenticationError as e:
+        print(f"[❌] Authentication failed: {e} - Ensure your SendGrid API key is correct and 'apikey' is used as username.")
+    except smtplib.SMTPServerDisconnected as e:
+        print(f"[❌] Server disconnected: {e} - Check port (465 for SSL) and network/firewall.")
+    except smtplib.SMTPRecipientsRefused as e:
+        print(f"[❌] Recipient refused: {e} - Verify the 'From' email is authenticated in SendGrid and 'To' email is valid.")
+    except Exception as e:
+        print(f"[❌] Error sending email: {type(e).__name__}: {e}")
 
 # ── Main SFTP processing function ─────────────────────────────────────────────
 
+def checkSFTP():
+    print("=" * 60)
+    print(
+        f"[Checking SFTP connection] : checkSFTP()")
+    print("=" * 60)
+    
+    key = paramiko.RSAKey.from_private_key_file(SFTP_KEY_PATH)
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    
+    try:
+        print(f"[INFO] Connecting to SFTP: {SFTP_HOST}")
+        ssh.connect(hostname=SFTP_HOST, username=SFTP_USER, pkey=key)
+        print("[✅] SFTP connection established.")
+        sftp = ssh.open_sftp()
+
+        files = sftp.listdir_attr(SFTP_REMOTE_DIR)
+        print(files)
+        
+        print(f"[INFO] Total files found: {len(files)}")
+
+        sftp.close()
+        ssh.close()
+        print("[✅] SFTP connection closed.")
+
+    except Exception as e:
+        print(f"[❌] SFTP Process Error: {e}")
 
 def fetch_files_from_sftp():
     print("=" * 60)
@@ -131,6 +202,7 @@ def fetch_files_from_sftp():
                     sort=[("createdAt", -1)]
                 )
 
+                # if existing:
                 if 1 != 1:
                     print("[INFO] Existing file found, reusing references.")
                     inspection_ref = existing["inspectionRef"]
@@ -190,10 +262,21 @@ def fetch_files_from_sftp():
                 else:
                     print(f"[WARN] No matching document found to update lastUpdatedAt for prefix '{prefix}'.")
 
+                # Send email notification after successful processing
+                subject = f"File Processing Completed: {file_name}"
+                body = f"The file '{file_name}' has been successfully downloaded, processed, and uploaded to the database.\n\nDetails:\n- Prefix: {prefix}\n- Modified Time: {file_mtime}\n- Inspection ID: {inspection_ref}\n- Checklist ID: {checklist_ref}"
+                send_email(subject, body)
+
                 successful += 1
 
             except Exception as file_err:
                 print(f"[❌] Error processing {file_name}: {file_err}")
+
+                # Send email notification on failure
+                subject = f"File Processing Failed: {file_name}"
+                body = f"An error occurred while processing the file '{file_name}'.\n\nError: {str(file_err)}\n\nDetails:\n- Prefix: {prefix}\n- Modified Time: {file_mtime}"
+                send_email(subject, body)
+
                 failed += 1
 
             # print("[INFO] Waiting 60 seconds before next file...")
