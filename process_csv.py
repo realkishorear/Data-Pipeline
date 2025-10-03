@@ -347,7 +347,7 @@ def process_csv_file(local_csv_path: str):
             ),
             "score": 0,
             "order": 0,
-            "userId": str(os.getenv("SYS_USER")),
+            "userId": str(process_model["userinfo"]),
             "notifyQuestions": [],
             "statusColumn": "",
             "page": 1,
