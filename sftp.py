@@ -203,7 +203,7 @@ def fetch_files_from_sftp():
                 )
 
                 # if existing:
-                if 1 != 1:
+                if existing:
                     print("[INFO] Existing file found, reusing references.")
                     inspection_ref = existing["inspectionRef"]
                     checklist_ref = existing["checklistRef"]
