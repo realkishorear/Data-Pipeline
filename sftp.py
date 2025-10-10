@@ -153,9 +153,9 @@ def fetch_files_from_sftp():
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
     processed = successful = failed = 0
-    company_ref = "68ca635393105c0c3fcd8b0e"
-    facility_ref = "68ca635393105c0c3fcd8b11"
-    userinfo = "68ca635393105c0c3fcd8b14"
+    company_ref = os.getenv("COMPANY_REF")
+    facility_ref = os.getenv("FACILITY_REF")
+    userinfo = os.getenv("USER_INFO")
     
     # Get the most recent createdAt from checklistfileuploads collection
     last_upload_doc = file_uploads_col.find_one({}, sort=[("createdAt", -1)])
