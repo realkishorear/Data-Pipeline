@@ -5,6 +5,9 @@ import re
 import time
 import logging
 import resource
+import multiprocessing
+import tempfile
+import shutil
 from datetime import datetime
 from bson import ObjectId
 from dateutil import parser as date_parser
@@ -32,15 +35,156 @@ def heap_usage():
 # ---------------------------------------------------------------------------
 
 
+def normalize_header(text):
+    text = str(text or "")
+    text = re.sub(r"<[^>]+>", "", text)  # remove HTML
+    return text.strip().lower()
+
+
+def process_single_row(row, row_order, question_meta, checklist_ref, inspection_ref, parsed_inspection_date, userid):
+    ops = []
+    for i, q in enumerate(question_meta):
+        value = row[i].strip() if i < len(row) else None
+        answer_obj = {
+            "_id": ObjectId(q["_id"]),
+            "isHide": q["isHide"],
+            "type": q["type"],
+            "title": q["title"],
+            "checklistRef": ObjectId(q["checklistRef"]),
+            "sectionRef": ObjectId(q["sectionRef"]),
+            "createdAt": date_parser.isoparse(q["createdAt"]),
+            "updatedAt": date_parser.isoparse(q["updatedAt"]),
+            "__v": q["__v"],
+            "checklistQuestionDetailsRef": q["checklistQuestionDetailsRef"],
+            "checklistQuestionRef": q["checklistQuestionRef"],
+            "indexOrder": q["indexOrder"],
+            "details": q.get("details", []),
+            "qtype": q["qtype"],
+            "scorevalue": 0,
+            "answer": None,
+            "scoring": q["scoring"],
+            "isDate": q["isDate"],
+            "isTime": q["isTime"],
+            "isSignature": q["isSignature"],
+            "mandatory": q["mandatory"],
+            "isAddnotes": q["isAddnotes"],
+            "ismultiselectdropdown": q["ismultiselectdropdown"],
+        }
+        # Value processing
+        if value not in (None, ""):
+            try:
+                if q["type"] == "Single choice responder":
+                    ans_single = next(
+                        (r for r in q.get("answerOptions", [])
+                         if normalize_header(r["name"]) == normalize_header(value)),
+                        None
+                    )
+                    if ans_single:
+                        answer_obj["scorevalue"] = float(
+                            ans_single.get("score", 0)) or 0
+                    answer_obj["answer"] = value
+
+                elif q["type"] == "Multiple choice responder":
+                    choices = [v.strip()
+                               for v in str(value).split(",")]
+                    score = 0
+                    for c in choices:
+                        ans_multi = next(
+                            (o for o in q.get("answerOptions", [])
+                             if normalize_header(o["name"]) == normalize_header(c)),
+                            None
+                        )
+                        if ans_multi:
+                            score += float(ans_multi.get("score", 0)) or 0
+                    answer_obj["scorevalue"] = score
+                    answer_obj["answer"] = choices
+
+                elif q["type"] == "Text answer":
+                    score = 0
+                    for sc in q.get("scoreOptions", []):
+                        if (
+                            (sc["condition"] == "is customized keyword" and sc.get(
+                                "count") == value)
+                            or (sc["condition"] == "is not blank" and value)
+                            or (sc["condition"] == "is blank" and not value)
+                        ):
+                            score += float(sc.get("score", 0)) or 0
+                    answer_obj["scorevalue"] = score
+                    answer_obj["answer"] = value
+
+                elif q["type"] == "Date & Time":
+                    date_output = check_date_and_time(value)
+                    if date_output["isValidDate"]:
+                        answer_obj["answer"] = {
+                            "date": date_output["date"]}
+
+                elif q["type"] in ["Slider", "Number"]:
+                    try:
+                        num_value = float(value)
+                    except ValueError:
+                        num_value = math.nan
+                    score = 0
+                    for sc in q.get("scoreOptions", []):
+                        try:
+                            cnt = float(sc["count"])
+                        except (ValueError, KeyError):
+                            cnt = 0
+                        cond = sc["condition"]
+                        if cond == "less than" and num_value < cnt:
+                            score += float(sc.get("score", 0)) or 0
+                        elif cond == "less than or equal to" and num_value <= cnt:
+                            score += float(sc.get("score", 0)) or 0
+                        elif cond == "equal to" and num_value == cnt:
+                            score += float(sc.get("score", 0)) or 0
+                        elif cond == "not equal to" and num_value != cnt:
+                            score += float(sc.get("score", 0)) or 0
+                        elif cond == "greater than or equal to" and num_value >= cnt:
+                            score += float(sc.get("score", 0)) or 0
+                        elif cond == "greater than" and num_value > cnt:
+                            score += float(sc.get("score", 0)) or 0
+                    answer_obj["scorevalue"] = score
+                    answer_obj["answer"] = value
+
+                else:
+                    answer_obj["answer"] = value
+            except Exception:
+                logger.exception(
+                    f"Failed to process value for question {q.get('title')}")
+
+        ops.append(
+            UpdateOne(
+                filter={
+                    "inspectionRef": inspection_ref,
+                    "checklistRef": checklist_ref,
+                    "answer.title": answer_obj["title"],
+                    "order": row_order,
+                },
+                update={
+                    "$set": {
+                        "checklistRef": checklist_ref,
+                        "inspectionDate": parsed_inspection_date,
+                        "inspectionRef": inspection_ref,
+                        "userRef": userid,
+                        "answer": answer_obj,
+                        "order": row_order,
+                        "commonId": q["commonId"],
+                        "isBulkSystemPickList": "zeropicklist",
+                        "updatedAt": datetime.utcnow(),
+                    },
+                    "$setOnInsert": {
+                        "createdAt": datetime.utcnow(),
+                    },
+                },
+                upsert=True
+            )
+        )
+    return ops
+
+
 def process_csv_file(local_csv_path: str):
     """
     Process a single CSV file and update Mongo collections accordingly.
     """
-
-    def normalize_header(text):
-        text = str(text or "")
-        text = re.sub(r"<[^>]+>", "", text)  # remove HTML
-        return text.strip().lower()
 
     logger.info(f"▶️ Starting processing for file: {local_csv_path}")
 
@@ -106,7 +250,8 @@ def process_csv_file(local_csv_path: str):
             logger.info(
                 f"Inspection scheduled: {process_model['inspectionRef']}")
 
-        parsed_inspection_date = parse(process_model["inspectionDate"]) if isinstance(process_model["inspectionDate"], str) else process_model["inspectionDate"]
+        parsed_inspection_date = parse(process_model["inspectionDate"]) if isinstance(
+            process_model["inspectionDate"], str) else process_model["inspectionDate"]
 
         # 4️⃣ Setup batching
         bulk_ops = []
@@ -160,7 +305,8 @@ def process_csv_file(local_csv_path: str):
                 else:
                     current_skip -= 1
             if current_skip != skip_rows:
-                logger.info(f"Adjusted skip_rows from {skip_rows} to {current_skip} based on complete rows in DB")
+                logger.info(
+                    f"Adjusted skip_rows from {skip_rows} to {current_skip} based on complete rows in DB")
                 checklist_file_upload_collection.update_one(
                     {"_id": file_doc["_id"]},
                     {"$set": {"lastRecord": current_skip}}
@@ -244,214 +390,46 @@ def process_csv_file(local_csv_path: str):
             {"_id": file_doc["_id"]},
             {"$set": {"status": "Failed", "errorMessage": "Processing error"}}
         )
+    
 
 # ---------------------------------------------------------------------------
 
-def stream_local_csv(local_path, bulk_ops, max_bulk_ops, checklist_inspection_model, file_uploads_col, file_id, skip_rows, question_meta, checklist_ref, inspection_ref, parsed_inspection_date, userid, start_order):
-    """Stream CSV rows and perform batched bulk writes with detailed logging and parallel processing."""
-    def normalize_header(text):
-        text = str(text or "")
-        text = re.sub(r"<[^>]+>", "", text)  # remove HTML
-        return text.strip().lower()
 
-    def process_single_row(row, row_order, question_meta, checklist_ref, inspection_ref, parsed_inspection_date, userid):
-        ops = []
-        for i, q in enumerate(question_meta):
-            value = row[i].strip() if i < len(row) else None
-            answer_obj = {
-                "_id": ObjectId(q["_id"]),
-                "isHide": q["isHide"],
-                "type": q["type"],
-                "title": q["title"],
-                "checklistRef": ObjectId(q["checklistRef"]),
-                "sectionRef": ObjectId(q["sectionRef"]),
-                "createdAt": date_parser.isoparse(q["createdAt"]),
-                "updatedAt": date_parser.isoparse(q["updatedAt"]),
-                "__v": q["__v"],
-                "checklistQuestionDetailsRef": q["checklistQuestionDetailsRef"],
-                "checklistQuestionRef": q["checklistQuestionRef"],
-                "indexOrder": q["indexOrder"],
-                "details": q.get("details", []),
-                "qtype": q["qtype"],
-                "scorevalue": 0,
-                "answer": None,
-                "scoring": q["scoring"],
-                "isDate": q["isDate"],
-                "isTime": q["isTime"],
-                "isSignature": q["isSignature"],
-                "mandatory": q["mandatory"],
-                "isAddnotes": q["isAddnotes"],
-                "ismultiselectdropdown": q["ismultiselectdropdown"],
-            }
-            # Value processing
-            if value not in (None, ""):
-                try:
-                    if q["type"] == "Single choice responder":
-                        ans_single = next(
-                            (r for r in q.get("answerOptions", [])
-                             if normalize_header(r["name"]) == normalize_header(value)),
-                            None
-                        )
-                        if ans_single:
-                            answer_obj["scorevalue"] = float(
-                                ans_single.get("score", 0)) or 0
-                        answer_obj["answer"] = value
+def process_chunk_copy(args):
+    chunk_path, rows_to_process, order_start, question_meta, checklist_ref, inspection_ref, parsed_inspection_date, userid, delimiter, max_bulk_ops = args
 
-                    elif q["type"] == "Multiple choice responder":
-                        choices = [v.strip()
-                                   for v in str(value).split(",")]
-                        score = 0
-                        for c in choices:
-                            ans_multi = next(
-                                (o for o in q.get("answerOptions", [])
-                                 if normalize_header(o["name"]) == normalize_header(c)),
-                                None
-                            )
-                            if ans_multi:
-                                score += float(ans_multi.get("score", 0)) or 0
-                        answer_obj["scorevalue"] = score
-                        answer_obj["answer"] = choices
+    client = MongoClient(os.getenv("DB_URL"))
+    db = client.get_default_database()
+    checklist_inspection_collection = db["checklistinspections"]
 
-                    elif q["type"] == "Text answer":
-                        score = 0
-                        for sc in q.get("scoreOptions", []):
-                            if (
-                                (sc["condition"] == "is customized keyword" and sc.get(
-                                    "count") == value)
-                                or (sc["condition"] == "is not blank" and value)
-                                or (sc["condition"] == "is blank" and not value)
-                            ):
-                                score += float(sc.get("score", 0)) or 0
-                        answer_obj["scorevalue"] = score
-                        answer_obj["answer"] = value
+    bulk_ops = []
+    dialect = csv.excel
+    dialect.delimiter = delimiter
+    dialect.skipinitialspace = True
 
-                    elif q["type"] == "Date & Time":
-                        date_output = check_date_and_time(value)
-                        if date_output["isValidDate"]:
-                            answer_obj["answer"] = {
-                                "date": date_output["date"]}
-
-                    elif q["type"] in ["Slider", "Number"]:
-                        try:
-                            num_value = float(value)
-                        except ValueError:
-                            num_value = math.nan
-                        score = 0
-                        for sc in q.get("scoreOptions", []):
-                            try:
-                                cnt = float(sc["count"])
-                            except (ValueError, KeyError):
-                                cnt = 0
-                            cond = sc["condition"]
-                            if cond == "less than" and num_value < cnt:
-                                score += float(sc.get("score", 0)) or 0
-                            elif cond == "less than or equal to" and num_value <= cnt:
-                                score += float(sc.get("score", 0)) or 0
-                            elif cond == "equal to" and num_value == cnt:
-                                score += float(sc.get("score", 0)) or 0
-                            elif cond == "not equal to" and num_value != cnt:
-                                score += float(sc.get("score", 0)) or 0
-                            elif cond == "greater than or equal to" and num_value >= cnt:
-                                score += float(sc.get("score", 0)) or 0
-                            elif cond == "greater than" and num_value > cnt:
-                                score += float(sc.get("score", 0)) or 0
-                        answer_obj["scorevalue"] = score
-                        answer_obj["answer"] = value
-
-                    else:
-                        answer_obj["answer"] = value
-                except Exception:
-                    logger.exception(
-                        f"Failed to process value for question {q.get('title')}")
-
-            ops.append(
-                UpdateOne(
-                    filter={
-                        "inspectionRef": inspection_ref,
-                        "checklistRef": checklist_ref,
-                        "answer.title": answer_obj["title"],
-                        "order": row_order,
-                    },
-                    update={
-                        "$set": {
-                            "checklistRef": checklist_ref,
-                            "inspectionDate": parsed_inspection_date,
-                            "inspectionRef": inspection_ref,
-                            "userRef": userid,
-                            "answer": answer_obj,
-                            "order": row_order,
-                            "commonId": q["commonId"],
-                            "isBulkSystemPickList": "zeropicklist",
-                            "updatedAt": datetime.utcnow(),
-                        },
-                        "$setOnInsert": {
-                            "createdAt": datetime.utcnow(),
-                        },
-                    },
-                    upsert=True
-                )
-            )
-        return ops
-
-    headers = []
-    is_header = True
-    row_number = 0
-    skipped = 0
-    batch = []
-    batch_size = 100  # Adjust based on memory and performance needs
-    processed_count = 0  # For logging processed rows
-
-    logger.info(f"Opening CSV file: {local_path}")
     try:
-        # Changed to latin-1 to handle 0xa0 and similar bytes
-        with open(local_path, "r", encoding="latin-1") as f:
-            sample = f.read(1024)
-            try:
-                dialect = csv.Sniffer().sniff(sample)
-            except csv.Error:
-                # Fallback to counting delimiters
-                comma_count = sample.count(',')
-                pipe_count = sample.count('|')
-                if pipe_count > comma_count:
-                    delimiter = '|'
-                else:
-                    delimiter = ','
-                dialect = csv.excel
-                dialect.delimiter = delimiter
-                logger.info(f"Fallback delimiter detected: {delimiter}")
-            # Override quoting and skipinitialspace to match original behavior
-            dialect.quoting = csv.QUOTE_NONE
-            dialect.skipinitialspace = True
-            f.seek(0)
-            csv_reader = csv.reader(
-                f, dialect=dialect, strict=False
-            )
+        with open(chunk_path, "r", encoding="latin-1") as f:
+            reader = csv.reader(f, dialect=dialect, strict=False)
 
-            for row in csv_reader:
-                # Added full strip to match TS trim: true
+            processed = 0
+            batch = []
+            batch_size = 500 
+            local_i = 0
+            while local_i < rows_to_process:
+                try:
+                    row = next(reader)
+                except StopIteration:
+                    break
                 row = [v.strip() for v in row]
-                if is_header:
-                    headers = row
-                    is_header = False
-                    logger.info(f"CSV headers detected: {headers}")
-                    logger.debug(f"CSV Headers raw: {headers}")
-                    logger.debug(
-                        f"CSV Headers normalized: {[normalize_header(h) for h in headers]}")
-                    continue
-
-                row_number += 1
-
+                local_i += 1
                 if not any(row):
-                    continue
-
-                if skipped < skip_rows:
-                    skipped += 1
                     continue
 
                 batch.append(row)
 
                 if len(batch) >= batch_size:
-                    row_orders = [start_order + processed_count + i for i in range(len(batch))]
+                    row_orders = [order_start + processed +
+                                  j for j in range(len(batch))]
                     results = Parallel(n_jobs=-1, backend='threading')(
                         delayed(process_single_row)(
                             batch[j],
@@ -468,31 +446,19 @@ def stream_local_csv(local_path, bulk_ops, max_bulk_ops, checklist_inspection_mo
                         bulk_ops.extend(ops)
                         if len(bulk_ops) >= max_bulk_ops:
                             logger.info(
-                                f"Flushing {len(bulk_ops)} ops at row {row_number}...")
-                            checklist_inspection_model.bulk_write(
+                                f"Flushing {len(bulk_ops)} ops in worker...")
+                            checklist_inspection_collection.bulk_write(
                                 bulk_ops, ordered=False)
                             bulk_ops.clear()
                             heap_usage()
 
-                    # Update lastRecord: skip_rows + current row_number (includes processed in this run)
-                    file_uploads_col.update_one(
-                        {"_id": file_id},
-                        {"$set": {"lastRecord": skip_rows + row_number}}
-                    )
-                    logger.info(f"✅ Updated lastRecord to {skip_rows + row_number}")
-
-                    processed_count += len(batch)
-                    if (skip_rows + row_number) % 1000 == 0:
-                        logger.info(f"Processed {skip_rows + row_number} rows so far...")
-
+                    processed += len(batch)
                     batch = []
 
-                    if row_number % 50 == 0:
-                        time.sleep(0)  # optional pause
-
-            # Process final batch
+            # Process final sub-batch
             if batch:
-                row_orders = [start_order + processed_count + i for i in range(len(batch))]
+                row_orders = [order_start + processed +
+                              j for j in range(len(batch))]
                 results = Parallel(n_jobs=-1, backend='threading')(
                     delayed(process_single_row)(
                         batch[j],
@@ -509,25 +475,162 @@ def stream_local_csv(local_path, bulk_ops, max_bulk_ops, checklist_inspection_mo
                     bulk_ops.extend(ops)
                     if len(bulk_ops) >= max_bulk_ops:
                         logger.info(
-                            f"Flushing {len(bulk_ops)} ops at row {row_number}...")
-                        checklist_inspection_model.bulk_write(
+                            f"Flushing {len(bulk_ops)} ops in worker...")
+                        checklist_inspection_collection.bulk_write(
                             bulk_ops, ordered=False)
                         bulk_ops.clear()
                         heap_usage()
 
-                file_uploads_col.update_one(
-                    {"_id": file_id},
-                    {"$set": {"lastRecord": skip_rows + row_number}}
+                processed += len(batch)
+
+            if bulk_ops:
+                logger.info(f"Flushing final {len(bulk_ops)} ops in worker...")
+                checklist_inspection_collection.bulk_write(
+                    bulk_ops, ordered=False)
+                bulk_ops.clear()
+                heap_usage()
+
+        os.remove(chunk_path)  # Clean up temp chunk file
+        return processed
+    except Exception:
+        logger.exception("process_chunk_copy failed")
+        if os.path.exists(chunk_path):
+            os.remove(chunk_path)
+        raise
+
+
+def stream_local_csv(local_path, bulk_ops, max_bulk_ops, checklist_inspection_model, file_uploads_col, file_id, skip_rows, question_meta, checklist_ref, inspection_ref, parsed_inspection_date, userid, start_order):
+    """Stream CSV rows and perform batched bulk writes with detailed logging and parallel chunk processing using temp chunk copies."""
+    headers = []
+    logger.info(f"Opening CSV file: {local_path} for dialect detection")
+    try:
+        with open(local_path, "r", encoding="latin-1") as f:
+            sample = f.read(1024)
+            try:
+                dialect = csv.Sniffer().sniff(sample, delimiters=',;\t| ')
+                dialect.doublequote = True
+            except csv.Error:
+                # Fallback to counting delimiters
+                comma_count = sample.count(',')
+                pipe_count = sample.count('|')
+                if pipe_count > comma_count:
+                    delimiter = '|'
+                else:
+                    delimiter = ','
+                dialect = csv.excel
+                dialect.delimiter = delimiter
+                dialect.doublequote = True
+                logger.info(f"Fallback delimiter detected: {delimiter}")
+            dialect.skipinitialspace = True
+            f.seek(0)
+            csv_reader = csv.reader(
+                f, dialect=dialect, strict=False
+            )
+            headers = next(csv_reader)
+            # Check if delimiter needs override
+            sample_comma = sample.count(',')
+            sample_pipe = sample.count('|')
+            if len(headers) < 10 and sample_pipe > sample_comma:
+                dialect.delimiter = '|'
+                dialect.doublequote = True
+                f.seek(0)
+                csv_reader = csv.reader(
+                    f, dialect=dialect, strict=False
                 )
-                logger.info(f"✅ Updated lastRecord to {skip_rows + row_number}")
+                headers = next(csv_reader)
+                logger.info(
+                    f"Overridden delimiter to '|' based on count comparison. New header length: {len(headers)}")
+            logger.info(f"CSV headers detected: {headers}")
 
-        if bulk_ops:
-            logger.info(f"Flushing final {len(bulk_ops)} ops...")
-            checklist_inspection_model.bulk_write(bulk_ops, ordered=False)
-            bulk_ops.clear()
-            heap_usage()
+        # Count total data rows (excluding header)
+        total_data_rows = 0
+        with open(local_path, "r", encoding="latin-1") as f:
+            reader = csv.reader(f, dialect=dialect, strict=False)
+            next(reader)  # skip header
+            for row in reader:
+                total_data_rows += 1
+        logger.info(f"Total data rows in CSV: {total_data_rows}")
 
-        logger.info(f"Finished reading {row_number} rows from CSV")
+        remaining_rows = max(0, total_data_rows - skip_rows)
+        if remaining_rows == 0:
+            logger.info("No remaining rows to process.")
+            return
+
+        # Optimal number of workers
+        num_workers = min(multiprocessing.cpu_count() // 2, 8)
+        if remaining_rows < num_workers * 10:
+            num_workers = max(1, remaining_rows // 10)
+        logger.info(f"Using {num_workers} workers for parallel processing.")
+
+        # Create a temporary directory for chunks
+        temp_dir = tempfile.mkdtemp(prefix='csv_chunks_')
+        logger.info(f"Created temporary directory for chunks: {temp_dir}")
+
+        # Create chunk files with unique names like file1.csv, file2.csv, etc.
+        chunk_paths = []
+        chunk_size = remaining_rows // num_workers
+        with open(local_path, "r", encoding="latin-1") as f:
+            reader = csv.reader(f, dialect=dialect, strict=False)
+            next(reader)  # Skip header
+            for _ in range(skip_rows):
+                next(reader)  # Skip processed rows
+
+            current_offset = 0
+            for i in range(num_workers):
+                # Unique file name
+                chunk_filename = f"file{i+1}.csv"
+                chunk_path = os.path.join(temp_dir, chunk_filename)
+
+                with open(chunk_path, 'w', encoding="latin-1", newline='') as temp_f:
+                    writer = csv.writer(temp_f, dialect=dialect)
+                    ch_rows = chunk_size if i < num_workers - \
+                        1 else remaining_rows - current_offset
+                    for _ in range(ch_rows):
+                        try:
+                            row = next(reader)
+                            writer.writerow(row)
+                        except StopIteration:
+                            break
+                chunk_paths.append(chunk_path)
+                current_offset += ch_rows
+                logger.info(
+                    f"Created temp chunk file: {chunk_path} with {ch_rows} rows")
+
+        chunks = []
+        current_offset = 0
+        for i in range(num_workers):
+            ch_rows = chunk_size if i < num_workers - \
+                1 else remaining_rows - current_offset
+            order_start = start_order + current_offset
+            chunks.append((
+                chunk_paths[i], ch_rows, order_start, question_meta, checklist_ref, inspection_ref,
+                parsed_inspection_date, userid, dialect.delimiter, max_bulk_ops
+            ))
+            current_offset += ch_rows
+
+        # Use joblib Parallel with multiprocessing backend for chunk processing
+        results = Parallel(n_jobs=num_workers, backend='multiprocessing')(
+            delayed(process_chunk_copy)(chunk) for chunk in chunks
+        )
+
+        total_processed = sum(results)
+        logger.info(f"Processed {total_processed} rows across all workers.")
+
+        # Update lastRecord at the end
+        new_last = skip_rows + total_data_rows
+        file_uploads_col.update_one(
+            {"_id": file_id},
+            {"$set": {"lastRecord": new_last}}
+        )
+        logger.info(f"✅ Updated lastRecord to {new_last}")
+
+        # Clean up the temporary directory
+        shutil.rmtree(temp_dir)
+        logger.info(f"Cleaned up temporary directory: {temp_dir}")
+
     except Exception:
         logger.exception("stream_local_csv failed")
+        # Clean up any remaining temp files and directory
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
         raise
