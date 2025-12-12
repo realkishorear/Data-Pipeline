@@ -157,12 +157,6 @@ def fetch_files_from_sftp():
     facility_ref = os.getenv("FACILITY_REF")
     userinfo = os.getenv("USER_INFO")
     
-    # Get the most recent createdAt from checklistfileuploads collection
-    last_upload_doc = file_uploads_col.find_one({}, sort=[("createdAt", -1)])
-    last_updated = last_upload_doc["createdAt"] if last_upload_doc else datetime.min
-
-    print(f"[INFO] Most recent upload time: {last_updated}")
-
     try:
         print(f"[INFO] Connecting to SFTP: {SFTP_HOST}")
         ssh.connect(hostname=SFTP_HOST, username=SFTP_USER, pkey=key)
@@ -181,71 +175,106 @@ def fetch_files_from_sftp():
 
             file_name = f.filename
             file_mtime = datetime.utcfromtimestamp(f.st_mtime)
-            
-            if file_mtime <= last_updated:
-                print(f"[SKIP] File {file_name} not modified after last upload time ({last_updated}).")
-                continue
-
-            processed += 1
-            remote_path = f"{SFTP_REMOTE_DIR}/{file_name}"
             prefix = file_name[:2].strip()
 
             print("-" * 60)
-            print(f"[{processed}] Processing file: {file_name}")
+            print(f"[{processed + 1}] Considering file: {file_name}")
             print(f"   ➤ Prefix: {prefix}")
             print(f"   ➤ File modified time: {file_mtime}")
 
+            # Check last upload for this specific file
+            last_for_file = file_uploads_col.find_one(
+                {"fileName": file_name},
+                sort=[("createdAt", -1)]
+            )
+
+            # Skip if already completed and file not modified since last processing
+            if (last_for_file and 
+                last_for_file.get("status") == "Completed" and 
+                file_mtime <= last_for_file.get("fileMtime", datetime.min)):
+                print(f"[SKIP] File {file_name} already completed and not modified since last process.")
+                continue
+
+            processed += 1
+
+            print(f"[INFO] Proceeding to process/retry {file_name}")
+
             try:
-                # Check if record already exists
-                existing = file_uploads_col.find_one(
-                    {"filePath": {"$regex": f"/{prefix}", "$options": "i"}},
-                    sort=[("createdAt", -1)]
-                )
+                checklist_ref = ensure_prefix_in_db(prefix)
+                if not checklist_ref:
+                    print(f"[⚠️] No checklist mapping for prefix {prefix}, skipping.")
+                    continue
 
-                # if existing:
-                if existing:
-                    print("[INFO] Existing file found, reusing references.")
-                    inspection_ref = existing["inspectionRef"]
-                    checklist_ref = existing["checklistRef"]
-                else:
-                    checklist_ref = ensure_prefix_in_db(prefix)
-                    if not checklist_ref:
-                        print(
-                            f"[⚠️] No checklist mapping for prefix {prefix}, skipping.")
-                        continue
-
-                    inspection_ref = create_system_inspection(
-                        company_ref, facility_ref, checklist_ref
-                    )
-
-                # Download file temporarily
+                remote_path = f"{SFTP_REMOTE_DIR}/{file_name}"
                 local_path = os.path.join(TEMP_DOWNLOAD_DIR, file_name)
-                print(f"[INFO] Downloading to: {local_path}")
-                sftp.get(remote_path, local_path)
-                print("[✅] Download complete.")
 
-                # Save record in DB
-                doc = {
-                    "checklistRef": ObjectId(checklist_ref),
-                    "inspectionRef": ObjectId(inspection_ref),
-                    "inspectionDate": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
-                    "filePath": local_path,
-                    "status": "Pending",
-                    "userinfo": ObjectId(userinfo),
-                    "companyRef": ObjectId(company_ref),
-                    "facilityRef": ObjectId(facility_ref),
-                    "isBulkSystemUpload": True,
-                    "source": "System",
-                    "lastRecord": 0,
-                    "createdAt": datetime.utcnow(),
-                    "__v":0,
-                    "fileName": file_name
-                }
-                file_uploads_col.insert_one(doc)
-                print("[✅] Document saved to checklistfileuploads.")
+                doc_id = None
+                inspection_ref = None
+
+                if last_for_file and last_for_file.get("status") != "Completed":
+                    # Reuse and update the existing non-completed record (failed or pending)
+                    doc_id = last_for_file["_id"]
+                    inspection_ref = last_for_file["inspectionRef"]
+                    print(f"[INFO] Reusing existing non-completed record (ID: {doc_id}) for {file_name}.")
+
+                    # Download file temporarily
+                    print(f"[INFO] Downloading to: {local_path}")
+                    sftp.get(remote_path, local_path)
+                    print("[✅] Download complete.")
+
+                    # Update the existing document
+                    update_fields = {
+                        "$set": {
+                            "status": "Pending",
+                            "filePath": local_path,
+                            "inspectionDate": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
+                            "fileMtime": file_mtime,
+                            "updatedAt": datetime.utcnow(),
+                        }
+                    }
+                    file_uploads_col.update_one({"_id": doc_id}, update_fields)
+                    print("[✅] Existing document updated in checklistfileuploads.")
+                else:
+                    # Create new inspection and document
+                    inspection_ref = create_system_inspection(company_ref, facility_ref, checklist_ref)
+
+                    # Download file temporarily
+                    print(f"[INFO] Downloading to: {local_path}")
+                    sftp.get(remote_path, local_path)
+                    print("[✅] Download complete.")
+
+                    # Save new record in DB
+                    doc = {
+                        "checklistRef": ObjectId(checklist_ref),
+                        "inspectionRef": ObjectId(inspection_ref),
+                        "inspectionDate": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
+                        "filePath": local_path,
+                        "status": "Pending",
+                        "userinfo": ObjectId(userinfo),
+                        "companyRef": ObjectId(company_ref),
+                        "facilityRef": ObjectId(facility_ref),
+                        "isBulkSystemUpload": True,
+                        "source": "System",
+                        "lastRecord": 0,
+                        "createdAt": datetime.utcnow(),
+                        "updatedAt": datetime.utcnow(),
+                        "__v": 0,
+                        "fileName": file_name,
+                        "fileMtime": file_mtime
+                    }
+                    result = file_uploads_col.insert_one(doc)
+                    doc_id = result.inserted_id
+                    print(f"[✅] New document saved to checklistfileuploads with ID: {doc_id}")
 
                 # Process CSV
                 process_csv_file(local_path)
+
+                # Assume no exception means success; update status to Completed
+                file_uploads_col.update_one(
+                    {"_id": doc_id},
+                    {"$set": {"status": "Completed", "updatedAt": datetime.utcnow()}}
+                )
+                print("[✅] Processing completed; status updated to Completed.")
 
                 # Delete the file after processing
                 if os.path.exists(local_path):
@@ -264,7 +293,7 @@ def fetch_files_from_sftp():
 
                 # Send email notification after successful processing
                 subject = f"File Processing Completed: {file_name}"
-                body = f"The file '{file_name}' has been successfully downloaded, processed, and uploaded to the database.\n\nDetails:\n- Prefix: {prefix}\n- Modified Time: {file_mtime}\n- Inspection ID: {inspection_ref}\n- Checklist ID: {checklist_ref}"
+                body = f"The file '{file_name}' has been successfully downloaded, processed, and uploaded to the database.\n\nDetails:\n- Prefix: {prefix}\n- Modified Time: {file_mtime}\n- Inspection ID: {inspection_ref}\n- Checklist ID: {checklist_ref}\n- Upload ID: {doc_id}"
                 send_email(subject, body)
 
                 successful += 1
@@ -272,15 +301,25 @@ def fetch_files_from_sftp():
             except Exception as file_err:
                 print(f"[❌] Error processing {file_name}: {file_err}")
 
+                # Update status to Failed if doc_id exists
+                if doc_id:
+                    file_uploads_col.update_one(
+                        {"_id": doc_id},
+                        {"$set": {"status": "Failed", "updatedAt": datetime.utcnow()}}
+                    )
+                    print(f"[INFO] Updated status to Failed for upload ID: {doc_id}")
+
+                # Clean up temp file if exists
+                if os.path.exists(local_path):
+                    os.remove(local_path)
+                    print(f"[INFO] Temporary file deleted: {local_path}")
+
                 # Send email notification on failure
                 subject = f"File Processing Failed: {file_name}"
                 body = f"An error occurred while processing the file '{file_name}'.\n\nError: {str(file_err)}\n\nDetails:\n- Prefix: {prefix}\n- Modified Time: {file_mtime}"
                 send_email(subject, body)
 
                 failed += 1
-
-            # print("[INFO] Waiting 60 seconds before next file...")
-            # time.sleep(60)
 
         print("=" * 60)
         print(
