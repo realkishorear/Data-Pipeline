@@ -148,6 +148,7 @@ def fetch_files_from_sftp():
         f"[fetch_files_from_sftp] Cron triggered at: {datetime.utcnow().isoformat()}")
     print("=" * 60)
 
+    # Step 01 : SFTP Connection Establishment
     key = paramiko.RSAKey.from_private_key_file(SFTP_KEY_PATH)
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -163,16 +164,20 @@ def fetch_files_from_sftp():
         print("[✅] SFTP connection established.")
         sftp = ssh.open_sftp()
 
+        # Step 02 : List all files in the remote directory
         files = sftp.listdir_attr(SFTP_REMOTE_DIR)
         print(files)
         
         print(f"[INFO] Total files found: {len(files)}")
 
+        # Step 03 : Process each file
         for f in files:
+            # Step 04 : Skip non-regular/hidden files
             if f.filename.startswith(".") or not stat.S_ISREG(f.st_mode):
                 print(f"[SKIP] Non-regular/hidden file: {f.filename}")
                 continue
 
+            # Step 05 : Extract file name and modified time
             file_name = f.filename
             file_mtime = datetime.utcfromtimestamp(f.st_mtime)
             prefix = file_name[:2].strip()
@@ -182,13 +187,12 @@ def fetch_files_from_sftp():
             print(f"   ➤ Prefix: {prefix}")
             print(f"   ➤ File modified time: {file_mtime}")
 
-            # Check last upload for this specific file
+            # Step 06 : Check if the file is already processed
             last_for_file = file_uploads_col.find_one(
                 {"fileName": file_name},
                 sort=[("createdAt", -1)]
             )
 
-            # Skip if already completed and file not modified since last processing
             if (last_for_file and 
                 last_for_file.get("status") == "Completed" and 
                 file_mtime <= last_for_file.get("fileMtime", datetime.min)):
@@ -199,6 +203,7 @@ def fetch_files_from_sftp():
 
             print(f"[INFO] Proceeding to process/retry {file_name}")
 
+            # Step 07 : Check if the checklist mapping exists
             try:
                 checklist_ref = ensure_prefix_in_db(prefix)
                 if not checklist_ref:

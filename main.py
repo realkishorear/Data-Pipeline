@@ -29,9 +29,7 @@ print(f"Scheduler started. Running every {TIME_IN_MINUTES} minutes.")
 
 schedule.every(TIME_IN_MINUTES).minutes.do(job)
 
-def test():
-    fetch_files_from_sftp()
-test()
+# for testing
 
 while True:
     schedule.run_pending()
