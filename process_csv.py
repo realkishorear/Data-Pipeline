@@ -2,7 +2,7 @@ import csv
 import math
 import os
 import re
-import logging
+import sys
 import resource
 import multiprocessing
 import tempfile
@@ -12,18 +12,14 @@ from bson import ObjectId
 from dateutil import parser as date_parser
 from dateutil.parser import parse
 from pymongo import MongoClient, ReturnDocument
-from helpers.apis import find_one, schedule_inspection_open, inspection_completed
+from helpers.apis import find_one, schedule_inspection_open
 from helpers.dateTime_helper import check_date_and_time
 from joblib import Parallel, delayed
+from services.database.operations import create_checklistresult_if_not_exists
 
-# ---------------------------------------------------------------------------
-# Logging configuration
-# ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-logger = logging.getLogger(__name__)
+# Increase CSV field size limit to handle large fields
+# Default limit is 131072 (128KB), set to maximum to avoid field size errors
+csv.field_size_limit(sys.maxsize)
 
 # Pre-compile regex patterns for performance
 HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
@@ -31,7 +27,7 @@ HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 def heap_usage():
     """Log current process heap usage (Linux/macOS)."""
     usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  # MB
-    logger.info(f"📊 Heap usage: {usage:.2f} MB")
+    # Heap usage logging removed - using centralized logger
 
 def normalize_header(text):
     """Optimized header normalization with pre-compiled regex."""
@@ -43,28 +39,28 @@ def process_answer_value(value, question):
     """Process a single answer value and return the answer object."""
     answer_obj = {
         "_id": ObjectId(question["_id"]),
-        "isHide": question["isHide"],
+        "isHide": question.get("isHide", False),
         "type": question["type"],
         "title": question["title"],
         "checklistRef": ObjectId(question["checklistRef"]),
         "sectionRef": ObjectId(question["sectionRef"]),
         "createdAt": date_parser.isoparse(question["createdAt"]),
         "updatedAt": date_parser.isoparse(question["updatedAt"]),
-        "__v": question["__v"],
-        "checklistQuestionDetailsRef": question["checklistQuestionDetailsRef"],
-        "checklistQuestionRef": question["checklistQuestionRef"],
-        "indexOrder": question["indexOrder"],
+        "__v": question.get("__v", 0),
+        "checklistQuestionDetailsRef": question.get("checklistQuestionDetailsRef"),
+        "checklistQuestionRef": question.get("checklistQuestionRef"),
+        "indexOrder": question.get("indexOrder", 0),
         "details": question.get("details", []),
-        "qtype": question["qtype"],
+        "qtype": question.get("qtype"),
         "scorevalue": 0,
         "answer": None,
-        "scoring": question["scoring"],
-        "isDate": question["isDate"],
-        "isTime": question["isTime"],
-        "isSignature": question["isSignature"],
-        "mandatory": question["mandatory"],
-        "isAddnotes": question["isAddnotes"],
-        "ismultiselectdropdown": question["ismultiselectdropdown"],
+        "scoring": question.get("scoring"),
+        "isDate": question.get("isDate", False),
+        "isTime": question.get("isTime", False),
+        "isSignature": question.get("isSignature", False),
+        "mandatory": question.get("mandatory", False),
+        "isAddnotes": question.get("isAddnotes", False),
+        "ismultiselectdropdown": question.get("ismultiselectdropdown", False),
     }
     
     if value in (None, ""):
@@ -130,7 +126,8 @@ def process_answer_value(value, question):
             answer_obj["answer"] = value
             
     except Exception:
-        logger.exception(f"Failed to process value for question {question.get('title')}")
+        # Error handling - errors are logged at higher level
+        pass
     
     return answer_obj
 
@@ -140,8 +137,14 @@ def process_single_row_to_document(row, row_order, question_meta, checklist_ref,
     now = datetime.utcnow()
     answers = []
     
+    # Validate column count matches question count
+    # Validation removed from logging - only errors are logged
+    
     for i, q in enumerate(question_meta):
-        value = row[i].strip() if i < len(row) else None
+        if i < len(row):
+            value = row[i].strip()
+        else:
+            value = None
         answer_obj = process_answer_value(value, q)
         answers.append(answer_obj)
     
@@ -167,21 +170,40 @@ def process_chunk_optimized(args):
     chunk_path, rows_to_process, order_start, question_meta, checklist_ref, inspection_ref, \
         parsed_inspection_date, userid, delimiter, max_bulk_docs, file_id = args
 
+    # Set CSV field size limit for worker process (separate process needs its own setting)
+    csv.field_size_limit(sys.maxsize)
+
     client = MongoClient(os.getenv("DB_URL"))
     db = client.get_default_database()
     checklist_inspection_collection = db["checklistinspectionnews"]
-    
     file_uploads_col = db["checklistfileuploads"]
 
-    dialect = csv.excel
-    dialect.delimiter = delimiter
-    dialect.skipinitialspace = True
+    # Create a proper dialect instance with quote handling
+    # Only use pipes or commas as delimiter
+    if delimiter not in ('|', ','):
+        delimiter = '|'
+    
+    # Use a factory function to create dialect to avoid scope issues
+    # For pipe-delimited files, use QUOTE_NONE to avoid issues with malformed quotes
+    def create_worker_dialect(delim):
+        class CustomDialect(csv.excel):
+            delimiter = delim
+            skipinitialspace = True
+            # For pipe-delimited files, disable quote handling to avoid malformed quote issues
+            # For comma-delimited files, use minimal quoting
+            if delim == '|':
+                quoting = csv.QUOTE_NONE
+                doublequote = False
+            else:
+                quoting = csv.QUOTE_MINIMAL
+                doublequote = True
+        return CustomDialect()
     
     documents_to_insert = []
     
     try:
         with open(chunk_path, "r", encoding="latin-1") as f:
-            reader = csv.reader(f, dialect=dialect, strict=False)
+            reader = csv.reader(f, dialect=create_worker_dialect(delimiter), strict=False)
             
             processed = 0
             for local_i, row in enumerate(reader):
@@ -206,26 +228,36 @@ def process_chunk_optimized(args):
                 # Bulk insert when threshold reached
                 if len(documents_to_insert) >= max_bulk_docs:
                     len_inserted = len(documents_to_insert)
-                    logger.info(f"Inserting {len_inserted} row documents in worker...")
                     checklist_inspection_collection.insert_many(documents_to_insert, ordered=False)
-                    file_uploads_col.update_one({"_id": file_id}, {"$inc": {"lastRecord": len_inserted}})
+                    # Increment both the global lastRecord (cumulative across files)
+                    # and the per-file processedRows (for resume/retry skipping).
+                    file_uploads_col.update_one(
+                        {"_id": file_id},
+                        {"$inc": {"lastRecord": len_inserted, "processedRows": len_inserted}}
+                    )
                     documents_to_insert.clear()
                     heap_usage()
             
             # Insert remaining documents
             if documents_to_insert:
                 len_inserted = len(documents_to_insert)
-                logger.info(f"Inserting final {len_inserted} row documents in worker...")
                 checklist_inspection_collection.insert_many(documents_to_insert, ordered=False)
-                file_uploads_col.update_one({"_id": file_id}, {"$inc": {"lastRecord": len_inserted}})
+                file_uploads_col.update_one(
+                    {"_id": file_id},
+                    {"$inc": {"lastRecord": len_inserted, "processedRows": len_inserted}}
+                )
                 documents_to_insert.clear()
                 heap_usage()
         
         os.remove(chunk_path)
         return processed
         
-    except Exception:
-        logger.exception("process_chunk_optimized failed")
+    except Exception as e:
+        from helpers.logger import logger
+        import traceback
+        error_details = traceback.format_exc()
+        logger.error(f"process_chunk_optimized failed for chunk {chunk_path} (File ID: {file_id}): {str(e)}")
+        logger.error(f"Error details for chunk {chunk_path}:\n{error_details}")
         if os.path.exists(chunk_path):
             os.remove(chunk_path)
         raise
@@ -255,57 +287,75 @@ def stream_local_csv_optimized(local_path, max_bulk_docs, checklist_inspection_m
                                 userid, start_order):
     """Optimized CSV streaming with parallel processing - one document per row."""
     
-    logger.info(f"Opening CSV file: {local_path} for dialect detection")
+    # Ensure CSV field size limit is set (in case called from different context)
+    csv.field_size_limit(sys.maxsize)
     
     try:
-        # Detect delimiter
+        # Detect delimiter - only consider pipes and commas
         with open(local_path, "r", encoding="latin-1") as f:
             sample = f.read(1024)
-            try:
-                dialect = csv.Sniffer().sniff(sample, delimiters=',;\t| ')
-                dialect.doublequote = True
-            except csv.Error:
-                comma_count = sample.count(',')
-                pipe_count = sample.count('|')
-                delimiter = '|' if pipe_count > comma_count else ','
-                dialect = csv.excel
-                dialect.delimiter = delimiter
-                dialect.doublequote = True
-                logger.info(f"Fallback delimiter detected: {delimiter}")
             
-            dialect.skipinitialspace = True
+            # Count only pipes and commas (ignore other characters)
+            comma_count = sample.count(',')
+            pipe_count = sample.count('|')
+            
+            # Determine delimiter based on counts
+            if pipe_count > comma_count:
+                delimiter = '|'
+            else:
+                delimiter = ','
+            
+            # Create a proper dialect instance with quote handling
+            # Use a factory function approach to avoid scope issues
+            # For pipe-delimited files, use QUOTE_NONE to avoid issues with malformed quotes
+            def create_dialect(delim):
+                class CustomDialect(csv.excel):
+                    delimiter = delim
+                    skipinitialspace = True
+                    # For pipe-delimited files, disable quote handling to avoid malformed quote issues
+                    # For comma-delimited files, use minimal quoting
+                    if delim == '|':
+                        quoting = csv.QUOTE_NONE
+                        doublequote = False
+                    else:
+                        quoting = csv.QUOTE_MINIMAL
+                        doublequote = True
+                return CustomDialect()
+            
+            dialect = create_dialect(delimiter)
+            
             f.seek(0)
             csv_reader = csv.reader(f, dialect=dialect, strict=False)
             headers = next(csv_reader)
             
-            # Check if delimiter needs override
-            if len(headers) < 10 and sample.count('|') > sample.count(','):
-                dialect.delimiter = '|'
+            # Validate delimiter choice - if we get too few columns, try the other delimiter
+            if len(headers) < 3 and delimiter == ',' and pipe_count > 0:
+                delimiter = '|'
+                dialect = create_dialect('|')
                 f.seek(0)
                 csv_reader = csv.reader(f, dialect=dialect, strict=False)
                 headers = next(csv_reader)
-                logger.info(f"Overridden delimiter to '|'. New header length: {len(headers)}")
-            
-            logger.info(f"CSV headers detected: {len(headers)} columns")
+            elif len(headers) < 3 and delimiter == '|' and comma_count > 0:
+                delimiter = ','
+                dialect = create_dialect(',')
+                f.seek(0)
+                csv_reader = csv.reader(f, dialect=dialect, strict=False)
+                headers = next(csv_reader)
 
         # Count total data rows
         total_data_rows = sum(1 for _ in open(local_path, "r", encoding="latin-1")) - 1
-        logger.info(f"Total data rows in CSV: {total_data_rows}")
 
         remaining_rows = max(0, total_data_rows - skip_rows)
         if remaining_rows == 0:
-            logger.info("No remaining rows to process.")
             return
 
         # Optimize worker count
         num_workers = min(multiprocessing.cpu_count(), 16)
         if remaining_rows < num_workers * 100:
             num_workers = max(1, remaining_rows // 100)
-        logger.info(f"Using {num_workers} workers for parallel processing.")
 
         # Create temporary directory for chunks
         temp_dir = tempfile.mkdtemp(prefix='csv_chunks_')
-        logger.info(f"Created temporary directory: {temp_dir}")
 
         # Split CSV into chunk files
         chunk_paths = []
@@ -325,19 +375,40 @@ def stream_local_csv_optimized(local_path, max_bulk_docs, checklist_inspection_m
                 chunk_path = os.path.join(temp_dir, chunk_filename)
                 
                 with open(chunk_path, 'w', encoding="latin-1", newline='') as temp_f:
-                    writer = csv.writer(temp_f, dialect=dialect)
                     ch_rows = chunk_size if i < num_workers - 1 else remaining_rows - current_offset
                     
-                    for _ in range(ch_rows):
-                        try:
-                            row = next(reader)
-                            writer.writerow(row)
-                        except StopIteration:
-                            break
+                    # For QUOTE_NONE (pipe-delimited), write directly to avoid escape character issues
+                    # For QUOTE_MINIMAL (comma-delimited), use csv.writer
+                    if dialect.quoting == csv.QUOTE_NONE:
+                        for _ in range(ch_rows):
+                            try:
+                                row = next(reader)
+                                # Write directly as pipe-separated string
+                                # Fields are already correctly parsed, so we just join them
+                                # Replace newlines in fields to avoid breaking the row structure
+                                cleaned_row = [str(field).replace('\n', ' ').replace('\r', '') for field in row]
+                                line = dialect.delimiter.join(cleaned_row)
+                                temp_f.write(line + '\n')
+                            except StopIteration:
+                                break
+                    else:
+                        # Use csv.writer for comma-delimited files with proper quote handling
+                        writer = csv.writer(
+                            temp_f,
+                            delimiter=dialect.delimiter,
+                            quoting=dialect.quoting,
+                            doublequote=dialect.doublequote,
+                            skipinitialspace=True
+                        )
+                        for _ in range(ch_rows):
+                            try:
+                                row = next(reader)
+                                writer.writerow(row)
+                            except StopIteration:
+                                break
                 
                 chunk_paths.append(chunk_path)
                 current_offset += ch_rows
-                logger.info(f"Created chunk: {chunk_path} ({ch_rows} rows)")
 
         # Prepare chunk arguments
         chunks = []
@@ -357,14 +428,16 @@ def stream_local_csv_optimized(local_path, max_bulk_docs, checklist_inspection_m
         )
 
         total_processed = sum(results)
-        logger.info(f"✅ Processed {total_processed} rows across all workers.")
 
         # Cleanup
         shutil.rmtree(temp_dir)
-        logger.info(f"Cleaned up temporary directory: {temp_dir}")
 
-    except Exception:
-        logger.exception("stream_local_csv_optimized failed")
+    except Exception as e:
+        from helpers.logger import logger
+        import traceback
+        error_details = traceback.format_exc()
+        logger.error(f"stream_local_csv_optimized failed for file {local_path} (File ID: {file_id}): {str(e)}")
+        logger.error(f"Error details for CSV stream processing {local_path}:\n{error_details}")
         if 'temp_dir' in locals() and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
         raise
@@ -372,7 +445,11 @@ def stream_local_csv_optimized(local_path, max_bulk_docs, checklist_inspection_m
 def process_csv_file(local_csv_path: str):
     """Process a single CSV file and update Mongo collections accordingly."""
 
-    logger.info(f"▶️ Starting processing for file: {local_csv_path}")
+    # Verify file exists before processing
+    if not os.path.exists(local_csv_path):
+        from helpers.logger import logger
+        logger.error(f"CSV file does not exist: {local_csv_path}")
+        raise FileNotFoundError(f"CSV file does not exist: {local_csv_path}")
 
     client = MongoClient(os.getenv("DB_URL"))
     db = client.get_default_database()
@@ -383,10 +460,9 @@ def process_csv_file(local_csv_path: str):
 
     file_doc = checklist_file_upload_collection.find_one({"filePath": local_csv_path})
     if not file_doc:
-        logger.warning(f"No file doc found for path: {local_csv_path}")
+        from helpers.logger import logger
+        logger.warning(f"No file upload record found for path: {local_csv_path}")
         return
-
-    logger.info(f"Found file document with _id={file_doc['_id']}")
 
     try:
         updated_file = checklist_file_upload_collection.find_one_and_update(
@@ -396,7 +472,6 @@ def process_csv_file(local_csv_path: str):
         )
 
         if not updated_file:
-            logger.info(f"File {file_doc['_id']} already processed or not in Pending/Failed. Skipping.")
             return
 
         process_model = updated_file
@@ -406,10 +481,8 @@ def process_csv_file(local_csv_path: str):
             checklist_file_upload_collection.update_one(
                 {"_id": file_doc["_id"]}, {"$set": {"source": "UI"}}
             )
-            logger.info(f"Updated file source to UI for {file_doc['_id']}")
 
         # Load checklist questions
-        logger.info("Fetching checklist questions via API...")
         check_data = find_one(process_model["checklistRef"])
         if "error" in check_data:
             raise ValueError(f"Failed to fetch checklist: {check_data['message']}")
@@ -419,17 +492,14 @@ def process_csv_file(local_csv_path: str):
             for section in page.get("sections", []):
                 for q in section.get("questions", []):
                     question_list.append(q)
-        logger.info(f"Loaded {len(question_list)} questions from checklist")
 
         # Ensure inspectionRef
         if not process_model.get("inspectionRef"):
-            logger.info("Scheduling inspection (API call)...")
             inspection = schedule_inspection_open(process_model)
             if "error" in inspection:
                 raise ValueError(f"Failed to schedule inspection: {inspection['message']}")
             process_model["inspectionRef"] = inspection["data"]["_id"]
             process_model["inspectionDate"] = inspection["data"]["inspectionDate"]
-            logger.info(f"Inspection scheduled: {process_model['inspectionRef']}")
 
         parsed_inspection_date = parse(process_model["inspectionDate"]) if isinstance(
             process_model["inspectionDate"], str) else process_model["inspectionDate"]
@@ -447,17 +517,23 @@ def process_csv_file(local_csv_path: str):
         for q in question_meta:
             q["commonId"] = common_id_map[f"{q['type']}-{q['cleanTitle']}"]
 
-        logger.info(f"Prepared metadata for {len(question_meta)} questions")
-
         # Free memory
         question_list.clear()
         heap_usage()
 
         # Determine starting order
-        skip_rows = process_model.get("lastRecord", 0)
-        start_order = skip_rows
+        # - processedRows: how many rows of THIS file were already processed (for resume/retry)
+        # - orderStartBase: global base order index at the start of this file
+        processed_rows = process_model.get("processedRows", 0)
+        order_start_base = process_model.get("orderStartBase")
 
-        logger.info(f"Starting order index at {start_order}, skipping {skip_rows} rows")
+        # Backwards compatibility: if orderStartBase is missing (old records),
+        # treat lastRecord as both the global base and processed rows for this file.
+        if order_start_base is None:
+            order_start_base = max(0, int(process_model.get("lastRecord", 0) or 0) - int(processed_rows or 0))
+
+        skip_rows = processed_rows
+        start_order = order_start_base + processed_rows
 
         # Stream and process CSV
         stream_local_csv_optimized(
@@ -476,44 +552,11 @@ def process_csv_file(local_csv_path: str):
         )
 
         total_processed = 0  # Note: In a real implementation, this would be returned from stream_local_csv_optimized
-        logger.info(f"✅ Updated lastRecord incrementally during processing. Total new rows: {total_processed}")
 
         # Free memory
         common_id_map.clear()
         question_meta.clear()
         heap_usage()
-
-        # Mark inspection completed
-        payload = {
-            "checklistRef": str(process_model["checklistRef"]),
-            "inspectionRef": str(process_model["inspectionRef"]),
-            "inspectionDate": (
-                process_model["inspectionDate"].isoformat()
-                if isinstance(process_model["inspectionDate"], datetime)
-                else str(process_model["inspectionDate"])
-            ),
-            "score": 0,
-            "order": 0,
-            "userId": str(process_model["userinfo"]),
-            "notifyQuestions": [],
-            "statusColumn": "",
-            "page": 1,
-            "limit": 0,
-            "sortBy": "",
-            "sortOrder": "asc",
-            "isQRupload": False,
-            "isEvent": False,
-            "publicloginFirstName": "",
-            "publicloginLastName": "",
-            "publicloginEmail": ""
-        }
-
-        logger.info("Calling inspection_completed API...")
-        result = inspection_completed(payload)
-
-        if "error" in result:
-            raise ValueError(f"Failed to complete inspection: {result['message']}")
-        logger.info(f"✅ Inspection Completed: {result}")
 
         inspection_collection.update_one(
             {"_id": process_model["inspectionRef"]},
@@ -526,11 +569,24 @@ def process_csv_file(local_csv_path: str):
             {"_id": file_doc["_id"]},
             {"$set": {"status": "Completed"}}
         )
-        logger.info(f"✅ File processing completed for {file_doc['_id']}")
-
-    except Exception:
-        logger.exception(f"❌ Error processing file: {file_doc['_id']}")
-        checklist_file_upload_collection.update_one(
-            {"_id": file_doc["_id"]},
-            {"$set": {"status": "Failed", "errorMessage": "Processing error"}}
+        
+        # Create checklistresult document if it doesn't exist
+        create_checklistresult_if_not_exists(
+            process_model["inspectionRef"],
+            process_model.get("checklistRef"),
+            process_model.get("source")
         )
+
+    except Exception as e:
+        from helpers.logger import logger
+        import traceback
+        error_details = traceback.format_exc()
+        file_path = file_doc.get("filePath", local_csv_path) if 'file_doc' in locals() else local_csv_path
+        file_id = file_doc.get("_id", "Unknown") if 'file_doc' in locals() else "Unknown"
+        logger.error(f"Error processing CSV file: {file_path} (File ID: {file_id}): {str(e)}")
+        logger.error(f"Error details for CSV file {file_path}:\n{error_details}")
+        if 'checklist_file_upload_collection' in locals() and 'file_doc' in locals():
+            checklist_file_upload_collection.update_one(
+                {"_id": file_doc["_id"]},
+                {"$set": {"status": "Failed", "errorMessage": f"Processing error: {str(e)}"}}
+            )

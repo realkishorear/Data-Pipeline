@@ -42,10 +42,10 @@ inserted_count = 0
 for doc in data:
     existing = collection.find_one({"acronym": doc["acronym"]})
     if existing:
-        print(f"⚠️ Skipping duplicate: {doc['acronym']}")
+        print(f"[WARN] Skipping duplicate: {doc['acronym']}")
     else:
         collection.insert_one(doc)
         inserted_count += 1
-        print(f"✅ Inserted: {doc['acronym']}")
+        print(f"[INFO] Inserted: {doc['acronym']}")
 
-print(f"\n✅ Done. Inserted {inserted_count} new documents into 'checklistmaps'.")
+print(f"\n[INFO] Done. Inserted {inserted_count} new documents into 'checklistmaps'.")

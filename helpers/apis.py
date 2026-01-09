@@ -1,13 +1,7 @@
 import os
-import logging
 import requests
 from requests.exceptions import RequestException, Timeout
-
-# ✅ Configure logging
-logging.basicConfig(
-    level=logging.INFO,  # Change to DEBUG for more details
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+from helpers.logger import logger
 
 def getAuthToken():
     
@@ -25,19 +19,18 @@ def getAuthToken():
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=30)
         response.raise_for_status()
-        logging.info(f"[inspection_completed] Success: {response.status_code}")
         authTokenJSON = response.json()
         auth_token = authTokenJSON['data']['access_token']
         return auth_token
 
     except Timeout:
-        logging.error("[inspection_completed] Request timed out")
+        logger.error("[getAuthToken] Request timed out")
         return {"error": "timeout", "message": "The request timed out"}
     except RequestException as e:
-        logging.exception("[inspection_completed] Request failed")
+        logger.error(f"[getAuthToken] Request failed: {e}")
         return {"error": "request_failed", "message": str(e)}
     except Exception as e:
-        logging.exception("[inspection_completed] Unexpected error")
+        logger.error(f"[getAuthToken] Unexpected error: {e}")
         return {"error": "unexpected", "message": str(e)}
     
     
@@ -49,29 +42,26 @@ def find_one(checklist_id: str):
     jwt_token = getAuthToken().strip()
         
     if not base_url:
-        logging.error("[find_one] BASE_API_URL not set")
+        logger.error("[find_one] BASE_API_URL not set")
         return {"error": "config", "message": "BASE_API_URL environment variable not set"}
 
     url = f"{base_url}/checklist/{checklist_id}"
     headers = {"Authorization": f"Bearer {jwt_token}"}
     payload = { "isExcel": True  }  # Payload for body
 
-    logging.info(f"[find_one] Requesting checklist_id={checklist_id} from {url}")
-
     try:
         response = requests.get(url, headers=headers, json=payload, timeout=30)
         response.raise_for_status()  # Raise error for 4xx/5xx
-        logging.info(f"[find_one] Success: {response.status_code}")
         return response.json()
 
     except Timeout:
-        logging.error("[find_one] Request timed out")
+        logger.error("[find_one] Request timed out")
         return {"error": "timeout", "message": "The request timed out"}
     except RequestException as e:
-        logging.exception("[find_one] Request failed")
+        logger.error(f"[find_one] Request failed: {e}")
         return {"error": "request_failed", "message": str(e)}
     except Exception as e:
-        logging.exception("[find_one] Unexpected error")
+        logger.error(f"[find_one] Unexpected error: {e}")
         return {"error": "unexpected", "message": str(e)}
 
 def schedule_inspection_open(process_model: dict):
@@ -79,7 +69,7 @@ def schedule_inspection_open(process_model: dict):
     base_url = os.getenv("BASE_API_URL")
     jwt_token = getAuthToken().strip()
     if not base_url:
-        logging.error("[schedule_inspection_open] BASE_API_URL not set")
+        logger.error("[schedule_inspection_open] BASE_API_URL not set")
         return {"error": "config", "message": "BASE_API_URL environment variable not set"}
 
     url = f"{base_url}/checklist/scheduleopen"
@@ -91,22 +81,19 @@ def schedule_inspection_open(process_model: dict):
         "facility": process_model.get("facilityRef", "")
     }
 
-    logging.info(f"[schedule_inspection_open] Sending request to {url}")
-
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=30)
         response.raise_for_status()
-        logging.info(f"[schedule_inspection_open] Success: {response.status_code}")
         return response.json()
 
     except Timeout:
-        logging.error("[schedule_inspection_open] Request timed out")
+        logger.error("[schedule_inspection_open] Request timed out")
         return {"error": "timeout", "message": "The request timed out"}
     except RequestException as e:
-        logging.exception("[schedule_inspection_open] Request failed")
+        logger.error(f"[schedule_inspection_open] Request failed: {e}")
         return {"error": "request_failed", "message": str(e)}
     except Exception as e:
-        logging.exception("[schedule_inspection_open] Unexpected error")
+        logger.error(f"[schedule_inspection_open] Unexpected error: {e}")
         return {"error": "unexpected", "message": str(e)}
 
 def inspection_completed(body: dict):
@@ -114,7 +101,7 @@ def inspection_completed(body: dict):
     base_url = os.getenv("BASE_API_URL")
     jwt_token = getAuthToken().strip()
     if not base_url:
-        logging.error("[inspection_completed] BASE_API_URL not set")
+        logger.error("[inspection_completed] BASE_API_URL not set")
         return {"error": "config", "message": "BASE_API_URL environment variable not set"}
 
     url = f"{base_url}/checklist/inspectioncompleted"
@@ -123,20 +110,17 @@ def inspection_completed(body: dict):
         "Content-Type": "application/json"
     }
 
-    logging.info("[inspection_completed] Sending inspection completion data")
-
     try:
         response = requests.post(url, json=body, headers=headers, timeout=30)
         response.raise_for_status()
-        logging.info(f"[inspection_completed] Success: {response.status_code}")
         return response.json()
 
     except Timeout:
-        logging.error("[inspection_completed] Request timed out")
+        logger.error("[inspection_completed] Request timed out")
         return {"error": "timeout", "message": "The request timed out"}
     except RequestException as e:
-        logging.exception("[inspection_completed] Request failed")
+        logger.error(f"[inspection_completed] Request failed: {e}")
         return {"error": "request_failed", "message": str(e)}
     except Exception as e:
-        logging.exception("[inspection_completed] Unexpected error")
+        logger.error(f"[inspection_completed] Unexpected error: {e}")
         return {"error": "unexpected", "message": str(e)}
